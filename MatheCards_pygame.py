@@ -5,8 +5,8 @@
 ╠══════════════════════════════════════════════════════════════════╣
 ║  HOW TO RUN:                                                     ║
 ║    pip install pygame                                            ║
-║    python MatheCards_pygame.py server      ← host                ║
-║    python MatheCards_pygame.py client      ← join                ║
+║    python MatheCards_pygame.py server      ← host               ║
+║    python MatheCards_pygame.py client      ← join               ║
 ║    python MatheCards_pygame.py             ← menu to choose      ║
 ║                                                                  ║
 ║  WHAT CHANGED vs the terminal version:                           ║
@@ -179,9 +179,12 @@ class NetworkServer:
         self.player_ids.append(p2_id)
         send_msg(conn2, "assigned_id", {"id":p2_id,"role":"player2"})
         print(f"Player 2 connected from {addr2[0]}")
+        # Create GameState BEFORE starting listener threads.
+        # If threads start first, a message can arrive while self.game is still
+        # None and cause:  AttributeError: 'NoneType' has no attribute 'on_message'
+        self.game = GameState(self)
         for pid in self.player_ids:
             threading.Thread(target=self._listen_player, args=(pid,), daemon=True).start()
-        self.game = GameState(self)
         self.game.run()
 
     def _listen_player(self, pid):
@@ -189,7 +192,8 @@ class NetworkServer:
         while True:
             msg = recv_msg(conn)
             if msg is None: print(f"Player {pid} disconnected."); break
-            self.game.on_message(pid, msg)
+            if self.game:   # extra guard just in case
+                self.game.on_message(pid, msg)
 
     def relay(self, from_pid, msg_type, data=None):
         for pid in self.player_ids:
@@ -335,14 +339,20 @@ class GameState:
         self.picks = {}; self.solved = {pid:False for pid in self.server.player_ids}
         while True:
             self.server.broadcast("pick_phase_start",{"timer":PICK_TIMER_SECONDS})
-            picks_result = self.wait_for_both("card_picked", timeout=PICK_TIMER_SECONDS+5)
+            # Wait for BOTH players to pick a card.
+            # wait_for_both() returns as soon as both have sent "card_picked",
+            # so the duel starts immediately — no need to wait for the full timer.
+            # If a player doesn't pick in time, auto-pick their first card.
+            picks_result = self.wait_for_both("card_picked", timeout=PICK_TIMER_SECONDS)
             p1,p2 = self.server.player_ids
             for pid in [p1,p2]:
                 if picks_result and pid in picks_result:
                     uid = picks_result[pid].get("uid")
                     self.picks[pid] = next((c for c in self.hands[pid] if c["uid"]==uid), self.hands[pid][0])
                 else:
+                    # Auto-pick first available card if timer expired
                     self.picks[pid] = self.hands[pid][0]
+                    self.server.send_to(pid, "auto_picked", {"card": self.picks[pid]})
             self.server.send_to(p1,"received_card",{"card":self.picks[p2]})
             self.server.send_to(p2,"received_card",{"card":self.picks[p1]})
             solve_time = SOLVE_TIMERS[self.difficulty]
@@ -398,9 +408,18 @@ class GameState:
             for pid in self.server.player_ids:
                 self.server.players[pid]["hand"] = self.hands[pid]
 
-            self.server.broadcast("hand_update",
-                {p1: len(self.hands[p1]), p2: len(self.hands[p2])})
+            # Send each player their updated hand AND the opponent's count.
+            # Keys use actual player ID strings so client can match self.my_id.
+            for pid in self.server.player_ids:
+                opp = self.server.other(pid)
+                self.server.send_to(pid, "hand_update", {
+                    "my_hand":   self.hands[pid],        # full updated hand
+                    "my_count":  len(self.hands[pid]),
+                    "opp_count": len(self.hands[opp]),
+                })
 
+            # Also send pick_phase_start after hand_update so both clients
+            # rebuild their PickScreen with fresh data.
             empty = [pid for pid in self.server.player_ids
                      if len(self.hands[pid]) == 0]
             if empty:
@@ -410,24 +429,67 @@ class GameState:
                     "winner_id":   winner,
                     "winner_name": self.server.players[winner]["name"],
                     "scores":      {pid: self.scores[pid]
-                                    for pid in self.server.player_ids}})
+                                    for pid in self.server.player_ids},
+                    "names":       {pid: self.server.players[pid]["name"]
+                                    for pid in self.server.player_ids},
+                })
                 time.sleep(3); return
 
-            # Neither emptied — start next pick cycle
+            # Neither emptied — send next pick phase
+            # pick_phase_start is sent here so both clients get a fresh PickScreen
             self.picks = {}
             self.server.broadcast("next_pick", {
                 "scores":     {pid: self.scores[pid] for pid in self.server.player_ids},
-                "opp_counts": {p1: len(self.hands[p1]), p2: len(self.hands[p2])},
                 "pick_timer": PICK_TIMER_SECONDS,
             })
+            # Small delay then send pick_phase_start so clients switch screens
+            time.sleep(0.5)
+            self.server.broadcast("pick_phase_start", {"timer": PICK_TIMER_SECONDS})
 
     def _check_game_over(self):
-        return any(self.scores[pid] >= math.ceil(self.total_rounds/2) for pid in self.server.player_ids)
+        # End early if any player has already won the majority of rounds.
+        # Example: Best of 5 → first to 3 wins ends the game immediately.
+        majority = math.ceil(self.total_rounds / 2)
+        return any(self.scores[pid] >= majority for pid in self.server.player_ids)
 
     def _game_over(self):
-        winner = max(self.scores, key=lambda p: self.scores[p])
-        self.server.broadcast("game_over",{"winner_id":winner,"winner_name":self.server.players[winner]["name"],
-                                            "scores":self.scores,"names":{pid:self.server.players[pid]["name"] for pid in self.server.player_ids}})
+        # Winner = player with the MOST points after all rounds.
+        # If tied on points, whoever has FEWER cards left wins.
+        # If still tied, it's a draw — broadcast both as winners.
+        p1, p2 = self.server.player_ids
+        s1, s2 = self.scores[p1], self.scores[p2]
+
+        if s1 > s2:
+            winner = p1
+        elif s2 > s1:
+            winner = p2
+        else:
+            # Tiebreaker — fewer cards remaining wins
+            c1 = len(self.hands.get(p1, []))
+            c2 = len(self.hands.get(p2, []))
+            if c1 < c2:   winner = p1
+            elif c2 < c1: winner = p2
+            else:         winner = None  # true draw
+
+        if winner:
+            self.server.broadcast("game_over", {
+                "winner_id":   winner,
+                "winner_name": self.server.players[winner]["name"],
+                "scores":      self.scores,
+                "names":       {pid: self.server.players[pid]["name"]
+                                for pid in self.server.player_ids},
+                "draw":        False,
+            })
+        else:
+            # Draw — tell both players
+            self.server.broadcast("game_over", {
+                "winner_id":   None,
+                "winner_name": "Draw!",
+                "scores":      self.scores,
+                "names":       {pid: self.server.players[pid]["name"]
+                                for pid in self.server.player_ids},
+                "draw":        True,
+            })
 
 
 # ════════════════════════════════════════════════════════════════
@@ -652,11 +714,16 @@ def draw_hand_row(surf, fonts, cards, start_x, y, selected_uid=None,
 def toast_surface(fonts, message, color=TEXT):
     """Create a small notification surface (blit near bottom of screen)."""
     font = fonts["body"]
+    # Clamp message length so it never crashes on very long strings
+    message = str(message)[:80]
     tw, th = font.size(message)
-    s = pygame.Surface((tw+28, th+14), pygame.SRCALPHA)
-    pygame.draw.rect(s, (*SURFACE, 230), s.get_rect(), border_radius=8)
+    # Use SRCALPHA surface for transparency
+    s = pygame.Surface((tw + 28, th + 14), pygame.SRCALPHA)
+    # Fill with semi-transparent dark background (RGBA)
+    s.fill((SURFACE[0], SURFACE[1], SURFACE[2], 220))
+    # Draw border using a solid color (no alpha needed for border)
     pygame.draw.rect(s, BORDER, s.get_rect(), 1, border_radius=8)
-    font.render_to = None  # not using freetype
+    # Render text — font.render returns a surface, no render_to needed
     ts = font.render(message, True, color)
     s.blit(ts, (14, 7))
     return s
@@ -1526,35 +1593,32 @@ class PygameClient:
                     self.screen.solved = True
 
         elif t == "hand_update":
-            # Just update card counts — never switch away from DuelScreen here.
-            # next_pick or round_over will handle the screen transition.
-            for sid, ct in d.items():
-                if sid == self.my_id:
-                    pass  # my hand is already tracked locally
-                else:
-                    self.opp_count = ct
+            # Server sends each player their own updated hand + opponent count.
+            # Update both so card counts and hand display are always accurate.
+            if "my_hand" in d:
+                self.my_hand   = d["my_hand"]
+            if "my_count" in d:
+                pass  # derived from my_hand length
+            if "opp_count" in d:
+                self.opp_count = d["opp_count"]
+            # Update pick screen if currently showing it
+            if isinstance(self.screen, PickScreen):
+                self.screen.hand      = self.my_hand
+                self.screen.opp_count = self.opp_count
 
         elif t == "obstacle":
             if isinstance(self.screen, DuelScreen):
                 self._receive_obstacle(d)
 
         elif t == "next_pick":
-            # Both players finished this duel cycle — go back to pick phase.
-            # Wait 2 seconds so the player can see the duel result before switching.
+            # Server signals duel cycle ended — update scores.
+            # The server will send pick_phase_start right after which
+            # will build the actual PickScreen with fresh hand data.
             for sid, sc in d.get("scores", {}).items():
                 if sid == self.my_id: self.my_score = sc
                 else:                 self.opp_score = sc
-            for sid, ct in d.get("opp_counts", {}).items():
-                if sid != self.my_id: self.opp_count = ct
-            timer = d.get("pick_timer", PICK_TIMER_SECONDS)
-            def delayed_pick():
-                time.sleep(2.0)
-                self.screen = PickScreen(
-                    self.my_hand, self.my_powers, self.opp_count,
-                    self.current_round, self.total_rounds,
-                    self.my_score, self.opp_score,
-                    self.my_name, self.opp_name, timer)
-            threading.Thread(target=delayed_pick, daemon=True).start()
+            # Show a brief result screen before pick_phase_start arrives
+            self.screen = WaitScreen("Duel over! Next pick phase starting...")
 
         elif t == "round_over":
             for sid,sc in d["scores"].items():
@@ -1569,11 +1633,17 @@ class PygameClient:
                                             self.my_name, self.opp_name, nxt)
 
         elif t == "game_over":
-            for sid,sc in d["scores"].items():
-                if sid==self.my_id: self.my_score=sc
-                else:               self.opp_score=sc
-            i_won = d["winner_id"] == self.my_id
-            self.screen = GameOverScreen(i_won, d["winner_name"],
+            for sid, sc in d["scores"].items():
+                if sid == self.my_id: self.my_score = sc
+                else:                 self.opp_score = sc
+            if d.get("draw"):
+                # True draw — show it as neither winning
+                i_won = False
+                winner_name = "It's a Draw!"
+            else:
+                i_won       = d.get("winner_id") == self.my_id
+                winner_name = d.get("winner_name", "")
+            self.screen = GameOverScreen(i_won, winner_name,
                                          self.my_score, self.opp_score,
                                          self.my_name, self.opp_name)
 
